@@ -1,105 +1,102 @@
-import os
+import sys
 import json
-import datetime
-import threading
-from flask import Flask, request, jsonify
-from google.oauth2.credentials import Credentials
-import gspread
+import re
 import requests
 from bs4 import BeautifulSoup
 
-app = Flask(__name__)
+BASE_URL = "https://en.shadowverse-evolve.com"
 
-# --- CONFIGURATION ---
-SPREADSHEET_ID = "1MUvlihIOgCCMkX7KZuuhCnNwSVacRWD3SFgfWFOcvKo"
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+def find_max_page(soup):
+    """Find the maximum number of pages from the HTML."""
+    pattern = r'var\smax_page\s*=\s*(\d+);'
+    match = re.search(pattern, soup.prettify())
+    if match:
+        return int(match.group(1))
+    else:
+        return 1
 
-def get_sheet_client():
-    raw_json = os.environ.get("OAUTH_CREDENTIALS_JSON")
-    if not raw_json:
-        print("ERROR: OAUTH_CREDENTIALS_JSON environment variable is missing!")
-        return None
-        
+def get_card_info(card_filter):
+    """Get card details from the card page."""
     try:
-        oauth_info = json.loads(raw_json)
-        creds = Credentials(
-            token=None,
-            refresh_token=oauth_info['refresh_token'],
-            token_uri=oauth_info.get('token_uri', 'https://oauth2.googleapis.com/token'),
-            client_id=oauth_info['client_id'],
-            client_secret=oauth_info['client_secret'],
-            scopes=SCOPES
-        )
-        return gspread.authorize(creds)
-    except Exception as e:
-        print(f"Auth Error: {e}")
-        return None
-
-def run_scraper_task(expansion):
-    """The actual scraping logic run in a separate thread."""
-    print(f"Starting scrape for {expansion}...")
-    client = get_sheet_client()
-    if not client:
-        return
-
-    try:
-        sh = client.open_by_key(SPREADSHEET_ID)
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        worksheet = sh.add_worksheet(title=f"{expansion} ({timestamp})", rows="1000", cols="3")
-        
-        url = f"https://en.shadowverse-evolve.com/cards/searchresults/?expansion_name={expansion}"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        
-        response = requests.get(url, headers=headers)
+        response = requests.get(BASE_URL + card_filter, headers={"User-Agent": "Mozilla/5.0"})
         soup = BeautifulSoup(response.text, 'html.parser')
+        card_info = soup.find('div', class_='txt-Inner')
+        if not card_info:
+            return {"format": "Unknown", "rarity": "Unknown"}
         
-        cards_data = []
+        card_craft = "Unknown"
+        card_rarity = "Unknown"
+        
+        # Find all dt elements that contain the labels
+        for dt in card_info.find_all('dt'):
+            dt_text = dt.text.strip()
+            # Get the next dd element
+            dd = dt.find_next('dd')
+            if dd:
+                if "Class" in dt_text:
+                    card_craft = dd.text.strip()
+                elif "Rarity" in dt_text:
+                    card_rarity = dd.text.strip()
+        
+        return {
+            "format": card_craft,
+            "rarity": card_rarity
+        }
+    except Exception as e:
+        return {"format": "Unknown", "rarity": "Unknown"}
+
+def scrape_expansion(expansion):
+    """Scrape all normal cards from a specific expansion and return as list of dicts."""
+    base_url = f"https://en.shadowverse-evolve.com/cards/searchresults/?expansion_name={expansion}"
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    # Get first page
+    response = requests.get(base_url, headers=headers)
+    soup = BeautifulSoup(response.text, 'html.parser')
+    max_page = find_max_page(soup)
+
+    cards_data = []
+    current_page = 1
+
+    while current_page <= max_page:
+        if current_page > 1:
+            url = f"{base_url}&page={current_page}"
+            response = requests.get(url, headers=headers)
+            soup = BeautifulSoup(response.text, 'html.parser')
+
+        # Parse cards on this page
         for link in soup.find_all('a', href=True):
             if "cardno=" in link['href']:
                 card_no = link['href'].split('cardno=')[1].split('&')[0]
-                img = link.find('img')
-                name = img.get('title') if img else "Unknown"
-                cards_data.append([card_no, name, f"https://en.shadowverse-evolve.com{link['href']}"])
+                # Filter for normal cards: second part starts with digit or 'T'
+                second_part = card_no.split('-')[1]
+                if second_part[0].isdigit() or second_part[0] == 'T':
+                    img = link.find('img')
+                    name = img.get('title') if img else "Unknown"
+                    link_url = f"https://en.shadowverse-evolve.com{link['href']}"
+                    
+                    # Get craft and rarity from individual card page
+                    card_filter = link['href']
+                    card_details = get_card_info(card_filter)
+                    craft = card_details["format"]
+                    rarity = card_details["rarity"]
+                    
+                    cards_data.append({
+                        "card_no": card_no,
+                        "name": name,
+                        "craft": craft,
+                        "rarity": rarity,
+                        "link": link_url
+                    })
 
-        if cards_data:
-            worksheet.append_row(["Card Number", "Card Name", "Link"])
-            worksheet.format('A1:C1', {'textFormat': {'bold': True}})
-            worksheet.append_rows(cards_data)
-            print(f"Success: {len(cards_data)} cards added.")
-    except Exception as e:
-        print(f"Scraper Task Failed: {e}")
+        current_page += 1
 
-@app.route('/')
-def home():
-    return f"""
-    <html>
-        <body style="font-family: sans-serif; padding: 50px;">
-            <h2>Shadowverse Scraper (Flask Edition)</h2>
-            <p>Target: <code>{SPREADSHEET_ID}</code></p>
-            <form action="/scrape" method="get">
-                <input type="text" name="expansion" value="ECP02" required>
-                <button type="submit">Scrape Now</button>
-            </form>
-        </body>
-    </html>
-    """
-
-@app.route('/scrape')
-def scrape():
-    expansion = request.args.get('expansion')
-    if not expansion:
-        return "Expansion code missing", 400
-
-    # Start the scraper in a background thread so the HTTP response returns immediately
-    thread = threading.Thread(target=run_scraper_task, args=(expansion,))
-    thread.start()
-
-    return jsonify({
-        "status": "Accepted",
-        "message": f"Scraping for {expansion} has started in the background."
-    })
+    return cards_data
 
 if __name__ == "__main__":
-    # Cloud Run passes the port via an environment variable
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
+    if len(sys.argv) < 2:
+        print("Usage: python main.py <expansion_name>")
+        sys.exit(1)
+    expansion = sys.argv[1]
+    cards = scrape_expansion(expansion)
+    print(json.dumps(cards, indent=4))
